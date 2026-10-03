@@ -25,7 +25,7 @@ describe('MessageBridge delivery modes', () => {
    * @param {boolean} [options.downgradeSteer] - Make the harness land steers in nextTurn,
    *   as it does when the turn is already aborting
    */
-  function createHarness({ running = true, busyDelivery = 'steer', downgradeSteer = false } = {}) {
+  function createHarness({ running = true, busyDelivery = 'steer', downgradeSteer = false, claimSteer = false, allowFrom = ['*'] } = {}) {
     const prompts = [];
     const sentMessages = [];
     const queueUpdates = [];
@@ -40,6 +40,7 @@ describe('MessageBridge delivery modes', () => {
           content: request.content,
           source: { kind: 'user', rpcId: request.requestId },
         };
+        if (claimSteer) return { accepted: true }; // consumed at the next step boundary
         if (request.mode === 'steer' && !downgradeSteer) inbox.nextStep.push(message);
         else inbox.nextTurn.push(message);
         return { accepted: true };
@@ -57,14 +58,14 @@ describe('MessageBridge delivery modes', () => {
       getActiveSessionId: async () => 'sess-1',
       getActiveSessionInfo: async () => ({ sessionId: 'sess-1', title: 'T', cwd: '/tmp/ws' }),
       getInbox: () => inbox,
-      steerQueueItem: async (itemId) => {
+      steerQueueItem: async (itemId, sessionId) => {
         if (queueErrors.has(itemId)) throw Object.assign(new Error('nope'), { code: queueErrors.get(itemId) });
-        queueUpdates.push({ sessionId: 'sess-1', itemId, action: { kind: 'steer' } });
+        queueUpdates.push({ sessionId: sessionId ?? 'sess-1', itemId, action: { kind: 'steer' } });
         return { accepted: true };
       },
-      removeQueueItem: async (itemId) => {
+      removeQueueItem: async (itemId, sessionId) => {
         if (queueErrors.has(itemId)) throw Object.assign(new Error('nope'), { code: queueErrors.get(itemId) });
-        queueUpdates.push({ sessionId: 'sess-1', itemId, action: { kind: 'remove' } });
+        queueUpdates.push({ sessionId: sessionId ?? 'sess-1', itemId, action: { kind: 'remove' } });
         return { accepted: true };
       },
     };
@@ -79,7 +80,7 @@ describe('MessageBridge delivery modes', () => {
 
     let config = {
       userOpenid: 'user_target',
-      allowFrom: ['*'],
+      allowFrom,
       defaultCwd: '',
       defaultPreset: 'standard',
       busyDelivery,
@@ -140,7 +141,7 @@ describe('MessageBridge delivery modes', () => {
     // The queued message is steerable afterwards — the same action the Web UI
     // offers on its queue rows.
     const buttons = reply.keyboard.content.rows.flatMap((row) => row.buttons).map((b) => b.action.data);
-    assert.deepEqual(buttons, ['/qsteer item_1', '/qdrop item_1']);
+    assert.deepEqual(buttons, ['/qsteer item_1 sess-1', '/qdrop item_1 sess-1']);
   });
 
   it('should let /steer and /queue override the configured default for one message', async () => {
@@ -195,7 +196,12 @@ describe('MessageBridge delivery modes', () => {
     assert.match(reply.text, /第二条排队消息/);
 
     const buttons = reply.keyboard.content.rows.flatMap((row) => row.buttons).map((b) => b.action.data);
-    assert.deepEqual(buttons, ['/qsteer item_a', '/qdrop item_a', '/qsteer item_b', '/qdrop item_b']);
+    assert.deepEqual(buttons, [
+      '/qsteer item_a sess-1',
+      '/qdrop item_a sess-1',
+      '/qsteer item_b sess-1',
+      '/qdrop item_b sess-1',
+    ]);
   });
 
   it('should say the queue is empty when nothing is pending', async () => {
@@ -214,6 +220,10 @@ describe('MessageBridge delivery modes', () => {
       action: { kind: 'steer' },
     });
     assert.match(harness.lastReply().text, /已插话/);
+
+    // A board rendered for another session still targets that session.
+    await harness.bridge.handleCommand('user_target', '/qsteer item_a sess-other', 'msg_in');
+    assert.equal(harness.queueUpdates.at(-1).sessionId, 'sess-other');
 
     await harness.bridge.handleCommand('user_target', '/qdrop item_b', 'msg_in');
     assert.deepEqual(harness.queueUpdates.at(-1), {
@@ -237,8 +247,14 @@ describe('MessageBridge delivery modes', () => {
   it('should show and switch the default delivery mode', async () => {
     const harness = createHarness({ running: true, busyDelivery: 'steer' });
 
+    // The mode card marks the configured mode and offers both switches.
     await harness.bridge.handleCommand('user_target', '/delivery', 'msg_in');
-    assert.match(harness.lastReply().text, /立即插话 \(steer\)/);
+    const card = harness.lastReply();
+    assert.match(card.text, /【插话方式】/);
+    assert.match(card.text, /立即插话\*\*：.*\*\*← 当前\*\*/);
+    const buttons = card.keyboard.content.rows.flatMap((row) => row.buttons);
+    assert.deepEqual(buttons.map((b) => b.action.data), ['/delivery steer', '/delivery queue', '/current']);
+    assert.ok(buttons[0].render_data.label.startsWith('✅ '));
 
     await harness.bridge.handleCommand('user_target', '/delivery queue', 'msg_in');
     assert.equal(harness.getConfig().busyDelivery, 'queue');
@@ -282,5 +298,78 @@ describe('MessageBridge delivery modes', () => {
     assert.match(reply.text, /已插话（下一个步骤注入）：1 条/);
     assert.match(reply.text, /已经插话的消息/);
     assert.equal(reply.keyboard, undefined);
+  });
+
+  it('should open the mode card from a QQ menu interaction that names the item', async () => {
+    const harness = createHarness({ running: true, busyDelivery: 'queue' });
+    harness.bridge.start();
+
+    // A menu interaction can deliver the item's name rather than its command, and
+    // a send_message item arrives as the plain text `/delivery`.
+    harness.bridge.gateway.emit('interaction', {
+      id: 'interact_delivery',
+      type: 12,
+      user_openid: 'user_target',
+      data: { type: 12, resolved: { send_message: '插话方式' } },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const card = harness.lastReply();
+    assert.match(card.text, /【插话方式】/);
+    assert.match(card.text, /排队\*\*：.*\*\*← 当前\*\*/);
+    const buttons = card.keyboard.content.rows.flatMap((row) => row.buttons);
+    assert.deepEqual(buttons.map((b) => b.action.data), ['/delivery steer', '/delivery queue', '/current']);
+    assert.ok(buttons[1].render_data.label.startsWith('✅ '));
+
+    harness.bridge.stop();
+  });
+
+  it('should expose the mode entry in the QQ global menu', async () => {
+    const { QQApiClient } = await import('../lib/qq/client.js');
+    const client = new QQApiClient({ logger: { info: () => {}, warn: () => {}, error: () => {} } });
+    const items = client.getDefaultMenu().items;
+
+    const entry = items.find((item) => item.name === '插话方式');
+    assert.deepEqual(entry, { type: 'send_message', name: '插话方式', send_message: '/delivery' });
+    assert.deepEqual(items.map((item) => item.name), ['会话列表', '当前会话', '插话方式', '统计信息', '切换模型', '快捷操作']);
+  });
+
+  it('should stay silent when a steered message was already claimed', async () => {
+    // The message left next-step because the next step boundary consumed it — that
+    // is a steer that worked, not a downgrade, and only next-turn proves a downgrade.
+    const harness = createHarness({ running: true, busyDelivery: 'steer', claimSteer: true });
+
+    await harness.bridge.handleUserPrompt('user_target', '插话内容', [], 'msg_in', null);
+
+    assert.equal(harness.prompts[0].mode, 'steer');
+    assert.equal(harness.sentMessages.length, 0, 'an already-consumed steer must not be reported as queued');
+  });
+
+  it('should ignore a menu interaction from a user outside the allowlist', async () => {
+    const harness = createHarness({ running: true, allowFrom: ['someone_else'] });
+    harness.bridge.start();
+
+    // The bound user is user_target, so this stranger is neither the owner nor allowlisted.
+    harness.bridge.gateway.emit('interaction', {
+      id: 'interact_blocked',
+      type: 12,
+      user_openid: 'intruder',
+      data: { type: 12, resolved: { send_message: '/delivery' } },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    assert.equal(harness.sentMessages.length, 0, 'a blocked interaction changes nothing');
+
+    // The owner still gets through.
+    harness.bridge.gateway.emit('interaction', {
+      id: 'interact_owner',
+      type: 12,
+      user_openid: 'user_target',
+      data: { type: 12, resolved: { send_message: '/delivery' } },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.match(harness.lastReply().text, /【插话方式】/);
+
+    harness.bridge.stop();
   });
 });
